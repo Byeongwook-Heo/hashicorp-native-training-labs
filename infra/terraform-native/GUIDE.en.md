@@ -50,7 +50,7 @@ filesystem to the executable read-only mirror and proves `terraform init`,
 
 The installer fetches the official `hashicorp/agent-skills` repository at
 commit `4451ceca5456e79cc776efee96a744f7ac96e5bf`. This is an explicitly pinned
-`main` snapshot whose integrated 16-Skill/Codex structure was `Unreleased` at
+`main` snapshot whose integrated 16-Skill/plugin structure was `Unreleased` at
 the snapshot date, not a floating branch or release tag. It verifies the exact Git
 object, the 16 active Terraform Skill names, frontmatter, symlink-free plugin
 tree, support documentation, and MPL-2.0 license before installing the complete product plugin

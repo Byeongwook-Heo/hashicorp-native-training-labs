@@ -2484,7 +2484,7 @@ jq -e '
     title: "작업에 맞는 Skill 조합 선택",
     objective: "일반 프롬프트 대신 작업 목적에 맞는 Skill을 명시적으로 선택하고 설치 경로를 기록합니다.",
     description: "스타일, 테스트, Module 리팩터링에 필요한 세 Skill과 선택 이유를 project manifest로 만드세요.",
-    concept: "한 제품 bundle에는 여러 Skill이 포함되지만 에이전트는 현재 작업에 필요한 최소 지침만 읽는 것이 효율적입니다. 공식 온라인 설치는 npx skills 또는 Codex repository marketplace를 사용합니다. 네트워크가 차단된 이 Lab에서는 검증된 스냅샷을 사용하고 설치 계획만 project manifest로 남깁니다.",
+    concept: "한 제품 bundle에는 여러 Skill이 포함되지만 에이전트는 현재 작업에 필요한 최소 지침만 읽는 것이 효율적입니다. 공식 온라인 설치는 npx skills 또는 호환 에이전트의 repository marketplace를 사용합니다. 네트워크가 차단된 이 Lab에서는 검증된 스냅샷을 사용하고 설치 계획만 project manifest로 남깁니다.",
     command: publicCommand("08-agent-skills", `${agentSkillsSelectionReady}
 cat selection.json`),
     expected: "refactor-module · terraform-style-guide · terraform-test의 공식 경로와 선택 목적",

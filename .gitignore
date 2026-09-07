@@ -10,7 +10,7 @@ dist-server/
 qa-*.png
 data/
 .playwright-cli/
-.codex-admin-preview/
+.*admin-preview/
 
 # Private runtime material: keep example configuration only
 private/
