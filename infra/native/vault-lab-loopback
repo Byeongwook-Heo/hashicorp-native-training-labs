@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
+readonly slot_count_file="/etc/vault-lab/native-slot-count"
+[[ -r "$slot_count_file" ]] || {
+  echo "vault-lab-loopback: slot count is missing" >&2
+  exit 65
+}
+IFS= read -r slot_count <"$slot_count_file"
+if [[ ! "$slot_count" =~ ^[0-9]+$ ]]; then
+  echo "vault-lab-loopback: invalid slot count" >&2
+  exit 65
+fi
+slot_count=$((10#$slot_count))
+if (( slot_count < 1 || slot_count > 99 )); then
+  echo "vault-lab-loopback: slot count out of range" >&2
+  exit 65
+fi
+
+for (( index=1; index<=slot_count; index+=1 )); do
+  slot_address="127.77.0.${index}"
+  ip address replace "${slot_address}/32" dev lo
+  if ! ip -o route get "$slot_address" \
+    | grep -Eq "src ${slot_address}([[:space:]]|$)"; then
+    echo "vault-lab-loopback: source address verification failed" >&2
+    exit 70
+  fi
+done

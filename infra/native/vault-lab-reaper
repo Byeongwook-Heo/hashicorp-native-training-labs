@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+readonly now_ms="$(( $(date +%s) * 1000 ))"
+readonly control_lock_root="/run/lock/vault-lab-control"
+umask 077
+shopt -s nullglob
+
+[[ -d "$control_lock_root" && ! -L "$control_lock_root" \
+  && "$(stat -c '%u:%g:%a' "$control_lock_root")" == "0:0:700" ]]
+exec {reaper_lock_fd}>"${control_lock_root}/reaper.lock"
+flock -x "$reaper_lock_fd"
+
+for expiry_file in /run/vault-lab/slots/s[0-9][0-9]/expires-at; do
+  slot="${expiry_file%/expires-at}"
+  slot="${slot##*/}"
+  [[ "$slot" =~ ^s[0-9]{2}$ ]] || continue
+  session_file="${expiry_file%/expires-at}/session-id"
+  [[ -f "$session_file" && ! -L "$session_file" ]] || continue
+  IFS= read -r session_id <"$session_file" || continue
+  [[ "$session_id" =~ ^[a-f0-9]{32}$ ]] || continue
+  IFS= read -r expires_at <"$expiry_file" || continue
+  [[ "$expires_at" =~ ^[0-9]{13}$ ]] || continue
+  if (( 10#$expires_at <= now_ms )); then
+    /usr/local/sbin/vault-lab-control reap "$slot" "$session_id" "$expires_at"
+  fi
+done

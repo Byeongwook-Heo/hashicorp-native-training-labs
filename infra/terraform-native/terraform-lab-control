@@ -1,0 +1,570 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+export LC_ALL=C
+umask 077
+
+readonly APP_USER=terraform-lab
+readonly STATE_ROOT=/var/lib/terraform-lab/sessions
+readonly RUNTIME_ROOT=/run/terraform-lab/slots
+readonly LOCK_ROOT=/run/lock/terraform-lab-control
+readonly SLOT_PATTERN='^s[0-9]{2}$'
+readonly GENERATION_PATTERN='^[a-f0-9]{32}$'
+readonly EXPIRY_PATTERN='^[0-9]{13}$'
+readonly MAX_EXPIRY_MS=86400000
+readonly TERRAFORM_CONFIG=/etc/terraform-lab/terraform.rc
+readonly PROVIDER_MIRROR=/opt/terraform-lab/providers
+readonly AGENT_SKILLS_ROOT=/opt/terraform-lab/agent-skills
+
+SLOT_LOCK_FD=
+SCOPE_UNIT=
+SCOPE_RUNNER_PID=
+SCOPE_CLEANED=true
+declare -a FROZEN_TERMINALS=()
+
+die() {
+  echo "terraform-lab-control: $*" >&2
+  exit 64
+}
+
+require_slot() {
+  local slot="${1:-}"
+  local number
+  [[ "$slot" =~ $SLOT_PATTERN ]] || die "invalid slot"
+  number="${slot#s}"
+  number=$((10#$number))
+  (( number >= 1 && number <= 99 )) || die "slot out of range"
+  id "tflab-${slot}" >/dev/null 2>&1 || die "slot user is not provisioned"
+}
+
+require_step() {
+  case "${1:-}" in
+    tf-version|local-init|saved-plan|apply-local|typed-inputs|auto-tfvars|\
+    local-render|sensitive-random|safe-output|state-inspect|drift-detect|\
+    drift-reconcile|backup-destroy|foreach-files|count-random|\
+    explicit-dependency|graph-export|module-contract|module-call|module-output|\
+    terraform-test|moved-refactor|tls-keypair|sensitive-state-audit|\
+    conditions-checks|lock-integrity|workspace-stage|replace-release|\
+    refresh-only|safe-destroy|agent-skills-catalog|agent-skills-select|\
+    agent-skills-install|agent-skills-guided-test)
+      ;;
+    *) die "unknown curriculum step" ;;
+  esac
+}
+
+acquire_slot_lock() {
+  local slot="$1"
+  [[ -d "$LOCK_ROOT" && ! -L "$LOCK_ROOT" ]] \
+    || die "control lock directory is unavailable"
+  exec {SLOT_LOCK_FD}>"${LOCK_ROOT}/${slot}.lock"
+  flock -x "$SLOT_LOCK_FD"
+}
+
+require_slot_filesystem() {
+  local slot="$1"
+  local state_dir="${STATE_ROOT}/${slot}"
+  local marker="${state_dir}/.terraform-lab-slot"
+  local mount_data option
+
+  [[ -d "$state_dir" && ! -L "$state_dir" ]] \
+    || die "slot filesystem mountpoint is unavailable"
+  mount_data="$(findmnt -rn -M "$state_dir" -o TARGET,FSTYPE,OPTIONS)" \
+    || die "slot filesystem is not mounted"
+  [[ "$mount_data" == "${state_dir} ext4 "* ]] \
+    || die "slot filesystem is not the expected ext4 target"
+  for option in rw nodev nosuid noexec; do
+    [[ ",${mount_data#* ext4 }," == *",${option},"* ]] \
+      || die "slot filesystem is missing ${option}"
+  done
+  [[ "$(stat -c '%u:%g:%a' -- "$state_dir")" == "0:0:711" ]] \
+    || die "slot filesystem root metadata is unsafe"
+  [[ -f "$marker" && ! -L "$marker" ]] \
+    || die "slot marker is unavailable"
+  [[ "$(stat -c '%u:%g:%h:%a' -- "$marker")" == "0:0:1:400" ]] \
+    || die "slot marker metadata is unsafe"
+  [[ "$(<"$marker")" == "terraform-lab:${slot}:v1" ]] \
+    || die "slot marker content is invalid"
+}
+
+require_runtime_directory() {
+  local slot="$1"
+  local runtime_dir="${RUNTIME_ROOT}/${slot}"
+  local app_uid slot_gid
+  app_uid="$(id -u "$APP_USER")"
+  slot_gid="$(id -g "tflab-${slot}")"
+  [[ -d /run/terraform-lab && ! -L /run/terraform-lab \
+    && "$(stat -c '%u:%g:%a' /run/terraform-lab)" == "0:0:711" ]] \
+    || die "runtime root parent is unsafe"
+  [[ -d "$RUNTIME_ROOT" && ! -L "$RUNTIME_ROOT" \
+    && "$(stat -c '%u:%g:%a' "$RUNTIME_ROOT")" == "0:0:711" ]] \
+    || die "runtime root is unsafe"
+  [[ -d "$runtime_dir" && ! -L "$runtime_dir" \
+    && "$(stat -c '%u:%g:%a' "$runtime_dir")" == "${app_uid}:${slot_gid}:2750" ]] \
+    || die "slot runtime directory is unsafe"
+}
+
+metadata_value() {
+  local slot="$1"
+  local key="$2"
+  jq -er --arg key "$key" '.[$key]' "${RUNTIME_ROOT}/${slot}/metadata.json"
+}
+
+require_binding() {
+  local slot="$1"
+  local expected_generation="$2"
+  local expected_expiry="${3:-}"
+  local runtime_dir="${RUNTIME_ROOT}/${slot}"
+  local app_uid slot_gid generation expiry metadata metadata_stats file stats
+
+  [[ "$expected_generation" =~ $GENERATION_PATTERN ]] \
+    || die "invalid expected generation"
+  require_slot_filesystem "$slot"
+  require_runtime_directory "$slot"
+  app_uid="$(id -u "$APP_USER")"
+  slot_gid="$(id -g "tflab-${slot}")"
+  for file in session-id expires-at metadata.json; do
+    [[ -f "${runtime_dir}/${file}" && ! -L "${runtime_dir}/${file}" ]] \
+      || die "session metadata is unavailable"
+    stats="$(stat -c '%u:%g:%h:%a' -- "${runtime_dir}/${file}")"
+    [[ "$stats" == "${app_uid}:${slot_gid}:1:640" ]] \
+      || die "session metadata ownership is unsafe"
+  done
+  generation="$(<"${runtime_dir}/session-id")"
+  expiry="$(<"${runtime_dir}/expires-at")"
+  [[ "$generation" == "$expected_generation" ]] \
+    || die "stale session generation"
+  [[ "$expiry" =~ $EXPIRY_PATTERN ]] || die "invalid session expiry"
+  if [[ -n "$expected_expiry" && "$expiry" != "$expected_expiry" ]]; then
+    die "stale session expiry"
+  fi
+  metadata="${runtime_dir}/metadata.json"
+  metadata_stats="$(stat -c %s -- "$metadata")"
+  (( metadata_stats > 40 && metadata_stats <= 1024 )) \
+    || die "session metadata size is unsafe"
+  jq -e \
+    --arg slot "$slot" \
+    --arg generation "$generation" \
+    --argjson expiry "$expiry" \
+    '.version == 1
+      and .slot == $slot
+      and .generation == $generation
+      and .expiresAt == $expiry
+      and (.id | type == "string" and test("^[a-f0-9]{32}$"))
+      and (.createdAt | type == "number" and floor == .)' \
+    "$metadata" >/dev/null \
+    || die "session metadata contract is invalid"
+}
+
+scoped_units() {
+  local kind="$1"
+  local slot="$2"
+  local unit
+  while IFS= read -r unit; do
+    [[ "$unit" =~ ^terraform-lab-${kind}-${slot}-[a-f0-9]{12}\.service$ ]] \
+      || continue
+    printf '%s\n' "$unit"
+  done < <(
+    systemctl list-units --all --full --plain --no-legend \
+      "terraform-lab-${kind}-${slot}-*.service" | awk '{print $1}'
+  )
+}
+
+stop_kind_units() {
+  local kind="$1"
+  local slot="$2"
+  local unit
+  while IFS= read -r unit; do
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+  done < <(scoped_units "$kind" "$slot")
+}
+
+stop_scoped_units() {
+  local slot="$1"
+  stop_kind_units terminal "$slot"
+  stop_kind_units command "$slot"
+}
+
+freeze_terminals() {
+  local slot="$1"
+  local unit state
+  FROZEN_TERMINALS=()
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
+    [[ "$state" == active ]] || continue
+    if ! systemctl freeze "$unit" >/dev/null; then
+      thaw_terminals
+      return 1
+    fi
+    FROZEN_TERMINALS+=("$unit")
+    if [[ "$(systemctl show -p FreezerState --value "$unit")" != frozen ]]; then
+      thaw_terminals
+      return 1
+    fi
+  done < <(scoped_units terminal "$slot")
+}
+
+thaw_terminals() {
+  local unit
+  for unit in "${FROZEN_TERMINALS[@]}"; do
+    systemctl thaw "$unit" >/dev/null 2>&1 || true
+  done
+  FROZEN_TERMINALS=()
+}
+
+reset_directory() {
+  local slot="$1"
+  local name="$2"
+  local mode="$3"
+  local owner="$4"
+  local state_dir="${STATE_ROOT}/${slot}"
+  local directory="${state_dir}/${name}"
+  case "$name" in home|tmp) ;; *) die "invalid reset directory" ;; esac
+  if [[ -e "$directory" || -L "$directory" ]]; then
+    [[ -d "$directory" && ! -L "$directory" ]] \
+      || die "unsafe slot subdirectory"
+    [[ "$(stat -c %d -- "$directory")" == "$(stat -c %d -- "$state_dir")" ]] \
+      || die "slot subdirectory crosses filesystem"
+    find "$directory" -xdev -mindepth 1 -delete
+    rmdir "$directory"
+  fi
+  install -d -o "$owner" -g "tflab-${slot}" -m "$mode" "$directory"
+}
+
+prepare_slot_locked() {
+  local slot="$1"
+  local runtime_dir="${RUNTIME_ROOT}/${slot}"
+  local app_uid slot_gid
+  stop_scoped_units "$slot"
+  require_slot_filesystem "$slot"
+  require_runtime_directory "$slot"
+  reset_directory "$slot" home 0700 "tflab-${slot}"
+  reset_directory "$slot" tmp 1700 "tflab-${slot}"
+  find "$runtime_dir" -xdev -mindepth 1 -delete
+  app_uid="$(id -u "$APP_USER")"
+  slot_gid="$(id -g "tflab-${slot}")"
+  [[ "$(stat -c '%u:%g:%a' "$runtime_dir")" == "${app_uid}:${slot_gid}:2750" ]] \
+    || die "runtime directory changed during reset"
+}
+
+new_unit_suffix() {
+  local uuid
+  IFS= read -r uuid </proc/sys/kernel/random/uuid
+  uuid="${uuid//-/}"
+  printf '%.12s' "$uuid"
+}
+
+common_scope_properties() {
+  local slot="$1"
+  local runtime_max="$2"
+  local memory_max="$3"
+  local memory_high="$4"
+  local state_dir="${STATE_ROOT}/${slot}"
+  printf '%s\n' \
+    '--property=UMask=0077' \
+    '--property=Slice=terraform-lab.slice' \
+    "--property=WorkingDirectory=${state_dir}/home" \
+    "--property=RuntimeMaxSec=${runtime_max}" \
+    '--property=TimeoutStopSec=5' \
+    '--property=KillMode=mixed' \
+    '--property=SendSIGKILL=yes' \
+    "--property=MemoryHigh=${memory_high}" \
+    "--property=MemoryMax=${memory_max}" \
+    '--property=MemorySwapMax=0' \
+    '--property=CPUQuota=75%' \
+    '--property=TasksMax=96' \
+    '--property=LimitNOFILE=2048' \
+    '--property=LimitNPROC=96' \
+    '--property=LimitCORE=0' \
+    '--property=NoNewPrivileges=yes' \
+    '--property=CapabilityBoundingSet=' \
+    '--property=AmbientCapabilities=' \
+    '--property=ProtectSystem=strict' \
+    '--property=ProtectHome=yes' \
+    '--property=PrivateDevices=yes' \
+    '--property=ProtectKernelTunables=yes' \
+    '--property=ProtectKernelModules=yes' \
+    '--property=ProtectKernelLogs=yes' \
+    '--property=ProtectControlGroups=yes' \
+    '--property=ProtectClock=yes' \
+    '--property=ProtectHostname=yes' \
+    '--property=ProtectProc=invisible' \
+    '--property=ProcSubset=pid' \
+    '--property=RestrictNamespaces=yes' \
+    '--property=RestrictRealtime=yes' \
+    '--property=RestrictSUIDSGID=yes' \
+    '--property=LockPersonality=yes' \
+    '--property=MemoryDenyWriteExecute=yes' \
+    '--property=RemoveIPC=yes' \
+    '--property=SystemCallArchitectures=native' \
+    '--property=SystemCallErrorNumber=EPERM' \
+    '--property=SystemCallFilter=@system-service' \
+    '--property=SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @swap' \
+    '--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' \
+    '--property=IPAddressDeny=any' \
+    "--property=ReadOnlyPaths=${PROVIDER_MIRROR} ${TERRAFORM_CONFIG} ${AGENT_SKILLS_ROOT}" \
+    "--property=ReadWritePaths=${state_dir}/home ${state_dir}/tmp" \
+    "--property=BindPaths=${state_dir}/tmp:/tmp"
+}
+
+require_root_owned_executable() {
+  local executable="$1"
+  local resolved owner group mode numeric_mode
+  [[ "$executable" == /* && "$executable" != *$'\n'* ]] \
+    || die "curriculum executable must be an absolute path"
+  resolved="$(readlink -f -- "$executable")" || die "executable cannot be resolved"
+  case "$resolved" in
+    /usr/bin/*|/usr/local/bin/*|/usr/local/libexec/terraform-lab-*) ;;
+    *) die "curriculum executable is outside trusted roots" ;;
+  esac
+  [[ -f "$resolved" && ! -L "$resolved" && -x "$resolved" ]] \
+    || die "curriculum executable is unavailable"
+  IFS=: read -r owner group mode < <(stat -c '%u:%g:%a' -- "$resolved")
+  [[ "$owner" == 0 ]] || die "curriculum executable is not root-owned"
+  numeric_mode=$((8#$mode))
+  (( (numeric_mode & 0022) == 0 )) \
+    || die "curriculum executable is group/world writable"
+  [[ "$group" =~ ^[0-9]+$ ]] || die "curriculum executable group is invalid"
+}
+
+cleanup_command_scope() {
+  local status=0
+  [[ "$SCOPE_CLEANED" == false ]] || return 0
+  SCOPE_CLEANED=true
+  set +e
+  if [[ -n "$SCOPE_UNIT" ]]; then
+    systemctl stop "$SCOPE_UNIT" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$SCOPE_RUNNER_PID" ]]; then
+    kill -TERM "$SCOPE_RUNNER_PID" >/dev/null 2>&1 || true
+    wait "$SCOPE_RUNNER_PID" >/dev/null 2>&1 || true
+    SCOPE_RUNNER_PID=
+  fi
+  thaw_terminals || status=$?
+  return "$status"
+}
+
+command_signal() {
+  exit 143
+}
+
+run_command() {
+  local slot="$1"
+  local generation="$2"
+  local operation="$3"
+  local step="$4"
+  shift 4
+  [[ "${1:-}" == -- ]] || die "missing argv separator"
+  shift
+  (( $# > 0 )) || die "missing curriculum argv"
+  [[ "$operation" == verify || "$operation" == skip ]] \
+    || die "invalid curriculum operation"
+  require_step "$step"
+  require_root_owned_executable "$1"
+
+  local slot_user="tflab-${slot}"
+  local unit runner_status cleanup_status=0 argument
+  local -a properties=() escaped_argv=()
+  # systemd 252 expands $VAR and ${VAR} in transient ExecStart argv. Double
+  # every dollar so the trusted curriculum reaches terraform-lab-exec exactly.
+  for argument in "$@"; do
+    escaped_argv+=("${argument//\$/\$\$}")
+  done
+  unit="terraform-lab-command-${slot}-$(new_unit_suffix)"
+  mapfile -t properties < <(common_scope_properties "$slot" 60 768M 640M)
+
+  acquire_slot_lock "$slot"
+  require_binding "$slot" "$generation"
+  stop_kind_units command "$slot"
+  freeze_terminals "$slot" || die "could not freeze learner terminal"
+  SCOPE_UNIT="$unit"
+  SCOPE_CLEANED=false
+  trap command_signal HUP INT TERM
+  trap cleanup_command_scope EXIT
+  systemd-run \
+    --quiet --collect --wait --pipe --service-type=exec \
+    "--unit=${unit}" \
+    "--uid=${slot_user}" "--gid=${slot_user}" \
+    "${properties[@]}" \
+    -- \
+    /usr/local/libexec/terraform-lab-exec "$slot" "${escaped_argv[@]}" &
+  SCOPE_RUNNER_PID=$!
+  if wait "$SCOPE_RUNNER_PID"; then
+    runner_status=0
+  else
+    runner_status=$?
+  fi
+  SCOPE_RUNNER_PID=
+  cleanup_command_scope || cleanup_status=$?
+  trap - EXIT HUP INT TERM
+  (( cleanup_status == 0 )) || return 65
+  return "$runner_status"
+}
+
+cleanup_terminal_scope() {
+  [[ "$SCOPE_CLEANED" == false ]] || return 0
+  SCOPE_CLEANED=true
+  set +e
+  if [[ -n "$SCOPE_UNIT" ]]; then
+    systemctl stop "$SCOPE_UNIT" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$SCOPE_RUNNER_PID" ]]; then
+    kill -TERM "$SCOPE_RUNNER_PID" >/dev/null 2>&1 || true
+    wait "$SCOPE_RUNNER_PID" >/dev/null 2>&1 || true
+    SCOPE_RUNNER_PID=
+  fi
+}
+
+terminal_signal() {
+  exit 143
+}
+
+run_terminal() {
+  local slot="$1"
+  local generation="$2"
+  local runtime_max="$3"
+  local slot_user="tflab-${slot}"
+  local unit runner_status registered=false input_fd
+  local -a properties=()
+  [[ "$runtime_max" =~ ^[0-9]+$ && "$runtime_max" -ge 1 \
+    && "$runtime_max" -le 86400 ]] || die "invalid terminal runtime"
+  unit="terraform-lab-terminal-${slot}-$(new_unit_suffix)"
+  mapfile -t properties < <(common_scope_properties "$slot" "$runtime_max" 512M 448M)
+
+  acquire_slot_lock "$slot"
+  require_binding "$slot" "$generation"
+  stop_kind_units terminal "$slot"
+  SCOPE_UNIT="$unit"
+  SCOPE_CLEANED=false
+  trap terminal_signal HUP INT TERM
+  trap cleanup_terminal_scope EXIT
+  exec {input_fd}<&0
+  systemd-run \
+    --quiet --collect --wait --pipe --service-type=exec \
+    "--unit=${unit}" \
+    "--uid=${slot_user}" "--gid=${slot_user}" \
+    "${properties[@]}" \
+    -- \
+    /usr/bin/script -qefc "/usr/local/libexec/terraform-lab-shell ${slot}" /dev/null \
+    <&"$input_fd" &
+  SCOPE_RUNNER_PID=$!
+  exec {input_fd}<&-
+  for _ in {1..100}; do
+    if [[ "$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)" == active ]]; then
+      registered=true
+      break
+    fi
+    kill -0 "$SCOPE_RUNNER_PID" 2>/dev/null || break
+    sleep 0.02
+  done
+  flock -u "$SLOT_LOCK_FD"
+  [[ "$registered" == true ]] || {
+    cleanup_terminal_scope
+    wait "$SCOPE_RUNNER_PID" >/dev/null 2>&1 || true
+    die "terminal unit did not start"
+  }
+  if wait "$SCOPE_RUNNER_PID"; then runner_status=0; else runner_status=$?; fi
+  SCOPE_RUNNER_PID=
+  cleanup_terminal_scope
+  trap - EXIT HUP INT TERM
+  return "$runner_status"
+}
+
+extend_session() {
+  local slot="$1"
+  local generation="$2"
+  local new_expiry="$3"
+  local runtime_dir="${RUNTIME_ROOT}/${slot}"
+  local now maximum app_uid slot_gid temporary
+  [[ "$new_expiry" =~ $EXPIRY_PATTERN ]] || die "invalid new expiry"
+  acquire_slot_lock "$slot"
+  require_binding "$slot" "$generation"
+  now="$(( $(date +%s) * 1000 ))"
+  maximum="$(( now + MAX_EXPIRY_MS ))"
+  (( 10#$new_expiry > now && 10#$new_expiry <= maximum )) \
+    || die "new expiry is outside the allowed window"
+  app_uid="$(id -u "$APP_USER")"
+  slot_gid="$(id -g "tflab-${slot}")"
+  temporary="${runtime_dir}/.expires-at.$$"
+  printf '%s\n' "$new_expiry" >"$temporary"
+  chown "$app_uid:$slot_gid" "$temporary"
+  chmod 0640 "$temporary"
+  mv -fT "$temporary" "${runtime_dir}/expires-at"
+  temporary="${runtime_dir}/.metadata.json.$$"
+  jq --argjson expiry "$new_expiry" '.expiresAt = $expiry' \
+    "${runtime_dir}/metadata.json" >"$temporary"
+  chown "$app_uid:$slot_gid" "$temporary"
+  chmod 0640 "$temporary"
+  mv -fT "$temporary" "${runtime_dir}/metadata.json"
+  require_binding "$slot" "$generation" "$new_expiry"
+}
+
+expire_session() {
+  local slot="$1"
+  local generation="$2"
+  local expected_expiry="$3"
+  local now
+  acquire_slot_lock "$slot"
+  if ! (require_binding "$slot" "$generation" "$expected_expiry") 2>/dev/null; then
+    return 0
+  fi
+  now="$(( $(date +%s) * 1000 ))"
+  (( 10#$expected_expiry <= now )) || return 0
+  prepare_slot_locked "$slot"
+}
+
+terminal_count() {
+  local slot="$1"
+  local count=0 unit
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] && count=$((count + 1))
+  done < <(scoped_units terminal "$slot")
+  printf '%d\n' "$count"
+}
+
+operation="${1:-}"
+shift || true
+case "$operation" in
+  prepare)
+    slot="${1:-}"
+    require_slot "$slot"
+    acquire_slot_lock "$slot"
+    prepare_slot_locked "$slot"
+    ;;
+  probe)
+    slot="${1:-}"
+    generation="${2:-}"
+    expiry="${3:-}"
+    require_slot "$slot"
+    acquire_slot_lock "$slot"
+    require_binding "$slot" "$generation" "$expiry"
+    ;;
+  command)
+    slot="${1:-}"
+    require_slot "$slot"
+    run_command "$@"
+    ;;
+  terminal)
+    slot="${1:-}"
+    require_slot "$slot"
+    run_terminal "$@"
+    ;;
+  extend)
+    slot="${1:-}"
+    require_slot "$slot"
+    extend_session "$@"
+    ;;
+  expire)
+    slot="${1:-}"
+    require_slot "$slot"
+    expire_session "$@"
+    ;;
+  terminal-count)
+    slot="${1:-}"
+    require_slot "$slot"
+    terminal_count "$slot"
+    ;;
+  *) die "unknown operation" ;;
+esac

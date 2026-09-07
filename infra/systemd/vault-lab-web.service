@@ -1,0 +1,70 @@
+[Unit]
+Description=Vault Lab native web application
+Documentation=https://github.com/Byeongwook-Heo/hashicorp-native-training-labs
+After=network-online.target vault-lab-loopback.service vault-lab-storage.target
+Wants=network-online.target
+Requires=vault-lab-loopback.service vault-lab-storage.target
+
+[Service]
+Type=simple
+User=vault-lab
+Group=vault-lab
+Slice=vault-lab.slice
+WorkingDirectory=/opt/vault-lab/current
+Environment=NODE_ENV=production
+Environment=PORT=3000
+EnvironmentFile=/etc/vault-lab/vault-lab.env
+# A native payload is not consumable until update-from-git completes its smoke.
+# Check both existence and symlink state so a dangling link also fails closed.
+ExecStartPre=/usr/bin/test ! -e /etc/vault-lab/native-smoke-pending
+ExecStartPre=/usr/bin/test ! -L /etc/vault-lab/native-smoke-pending
+ExecStartPre=/usr/bin/test -r /opt/vault-lab/current/dist-server/index.js
+ExecStart=!/usr/bin/setpriv --reuid=vault-lab --regid=vault-lab --clear-groups -- /usr/bin/node-22 /opt/vault-lab/current/dist-server/index.js
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=30
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+
+# The ! prefix lets systemd establish the sandbox before root-owned setpriv
+# immediately drops the main process to vault-lab. This preserves the strict
+# namespace/seccomp controls without implicitly setting no_new_privs, which
+# would block the sudoers-pinned control broker.
+NoNewPrivileges=no
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=all
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+ReadOnlyPaths=/proc/sys /sys
+InaccessiblePaths=-/proc/kmsg -/dev/kmsg -/usr/lib/modules
+ReadWritePaths=/var/lib/vault-lab /run/vault-lab/app /run/vault-lab/slots /run/lock/vault-lab-control /run/sudo
+
+MemoryHigh=512M
+MemoryMax=768M
+MemorySwapMax=0
+CPUQuota=150%
+TasksMax=256
+LimitNOFILE=8192
+LimitRTPRIO=0
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

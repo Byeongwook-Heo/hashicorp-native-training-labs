@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly SLOT_PATTERN='^s[0-9]{2}$'
+readonly slot="${1:-}"
+[[ "$slot" =~ $SLOT_PATTERN ]] || exit 64
+
+readonly home_dir="/var/lib/terraform-lab/sessions/${slot}/home"
+export HOME="$home_dir"
+export TMPDIR=/tmp
+export TF_CLI_CONFIG_FILE=/etc/terraform-lab/terraform.rc
+export TF_DATA_DIR=.terraform
+export CHECKPOINT_DISABLE=1
+export AWS_EC2_METADATA_DISABLED=true
+export TF_INPUT=0
+export TF_IN_AUTOMATION=1
+export LANG=C.UTF-8
+export PATH=/usr/local/bin:/usr/bin:/bin
+export HISTFILE="${home_dir}/.bash_history"
+export HISTCONTROL=ignoreboth:erasedups
+export HISTSIZE=500
+export PS1='\[\e[36m\]terraform-lab\[\e[0m\] \w \$ '
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FILE
+unset AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
+unset AWS_WEB_IDENTITY_TOKEN_FILE AWS_ROLE_ARN AWS_ROLE_SESSION_NAME
+unset TF_TOKEN_app_terraform_io TF_CLI_ARGS TF_CLI_ARGS_init
+umask 077
+cd "$home_dir"
+
+printf '\033[36mTerraform Native Lab\033[0m  |  session: %s  |  Docker-free\n' "$slot"
+printf 'Terraform 1.15.8 · offline provider mirror\n\n'
+exec /bin/bash --noprofile --norc -i

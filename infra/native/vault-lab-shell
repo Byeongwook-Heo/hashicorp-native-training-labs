@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly SLOT_PATTERN='^s[0-9]{2}$'
+readonly slot="${1:-}"
+[[ "$slot" =~ $SLOT_PATTERN ]] || exit 64
+
+readonly runtime_dir="/run/vault-lab/slots/${slot}"
+readonly home_dir="/var/lib/vault-lab/sessions/${slot}/home"
+IFS= read -r vault_port <"${runtime_dir}/port"
+IFS= read -r vault_address <"${runtime_dir}/address"
+IFS= read -r vault_token <"${runtime_dir}/student-token"
+[[ "$vault_port" == "820" ]] || exit 65
+readonly slot_number="$((10#${slot#s}))"
+[[ "$vault_address" == "127.77.0.${slot_number}" ]] || exit 65
+[[ -n "$vault_token" ]] || exit 65
+
+export HOME="$home_dir"
+export TMPDIR="/tmp"
+export VAULT_ADDR="http://${vault_address}:${vault_port}"
+export VAULT_TOKEN="$vault_token"
+export VAULT_FORMAT="table"
+export HISTFILE="${home_dir}/.bash_history"
+export HISTCONTROL="ignoreboth:erasedups"
+export HISTSIZE=500
+export LANG="C.UTF-8"
+export PATH="/usr/local/bin:/usr/bin:/bin"
+export PS1='\[\e[35m\]vault-lab\[\e[0m\] \w \$ '
+umask 077
+cd "$home_dir"
+
+printf '\033[35mVault Native Lab\033[0m  |  session: %s  |  Docker-free\n' "$slot"
+printf 'VAULT_ADDR=%s\n\n' "$VAULT_ADDR"
+exec /bin/bash --noprofile --norc -i

@@ -1,0 +1,63 @@
+[Unit]
+Description=Terraform Lab native web application
+Documentation=https://github.com/Byeongwook-Heo/hashicorp-native-training-labs
+After=network-online.target terraform-lab-storage.target
+Wants=network-online.target
+Requires=terraform-lab-storage.target
+
+[Service]
+Type=simple
+User=terraform-lab
+Group=terraform-lab
+Slice=terraform-lab.slice
+WorkingDirectory=/opt/terraform-lab/current
+Environment=NODE_ENV=production
+Environment=PORT=3000
+EnvironmentFile=/etc/terraform-lab/terraform-lab.env
+ExecStartPre=/usr/bin/test -r /opt/terraform-lab/current/dist-server/index.js
+ExecStart=!/usr/bin/setpriv --reuid=terraform-lab --regid=terraform-lab --clear-groups -- /usr/bin/node-22 /opt/terraform-lab/current/dist-server/index.js
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=30
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+
+# The root-owned broker is the only privileged transition. The service starts
+# with systemd's sandbox, then setpriv immediately drops back to terraform-lab.
+NoNewPrivileges=no
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=all
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+ReadOnlyPaths=/proc/sys /sys /opt/terraform-lab/providers /etc/terraform-lab/terraform.rc
+InaccessiblePaths=-/proc/kmsg -/dev/kmsg -/usr/lib/modules
+ReadWritePaths=/var/lib/terraform-lab/app /var/lib/terraform-lab/content /var/lib/terraform-lab/sessions /run/terraform-lab/app /run/terraform-lab/slots /run/lock/terraform-lab-control /run/sudo
+
+MemoryHigh=512M
+MemoryMax=768M
+MemorySwapMax=0
+CPUQuota=150%
+TasksMax=256
+LimitNOFILE=8192
+LimitRTPRIO=0
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

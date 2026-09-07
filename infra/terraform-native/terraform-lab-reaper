@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+readonly RUNTIME_ROOT=/run/terraform-lab/slots
+readonly SLOT_PATTERN='^s[0-9]{2}$'
+readonly GENERATION_PATTERN='^[a-f0-9]{32}$'
+readonly EXPIRY_PATTERN='^[0-9]{13}$'
+
+[[ -d "$RUNTIME_ROOT" && ! -L "$RUNTIME_ROOT" ]] || exit 0
+now="$(( $(date +%s) * 1000 ))"
+for runtime_dir in "${RUNTIME_ROOT}"/s[0-9][0-9]; do
+  [[ -d "$runtime_dir" && ! -L "$runtime_dir" ]] || continue
+  slot="${runtime_dir##*/}"
+  [[ "$slot" =~ $SLOT_PATTERN ]] || continue
+  [[ -f "${runtime_dir}/session-id" && ! -L "${runtime_dir}/session-id" ]] \
+    || continue
+  [[ -f "${runtime_dir}/expires-at" && ! -L "${runtime_dir}/expires-at" ]] \
+    || continue
+  generation="$(<"${runtime_dir}/session-id")"
+  expiry="$(<"${runtime_dir}/expires-at")"
+  [[ "$generation" =~ $GENERATION_PATTERN && "$expiry" =~ $EXPIRY_PATTERN ]] \
+    || continue
+  if (( 10#$expiry <= now )); then
+    /usr/local/sbin/terraform-lab-control \
+      expire "$slot" "$generation" "$expiry"
+  fi
+done

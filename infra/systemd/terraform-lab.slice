@@ -1,0 +1,12 @@
+[Unit]
+Description=Aggregate resource boundary for Terraform Lab
+
+[Slice]
+CPUAccounting=yes
+CPUQuota=180%
+MemoryAccounting=yes
+MemoryHigh=3200M
+MemoryMax=3600M
+MemorySwapMax=0
+TasksAccounting=yes
+TasksMax=1024

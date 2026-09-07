@@ -1,0 +1,72 @@
+[Unit]
+Description=Vault training session in native slot %i
+Documentation=https://developer.hashicorp.com/vault/docs
+After=network.target
+Wants=network.target
+After=vault-lab-loopback.service
+Requires=vault-lab-loopback.service
+After=vault-lab-storage.target
+Requires=vault-lab-storage.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=vaultsvc-%i
+Group=vaultlab-%i
+UMask=0077
+WorkingDirectory=/var/lib/vault-lab/sessions/%i
+ExecStart=/usr/local/bin/vault server -config=/run/vault-lab/slots/%i/vault.hcl
+Restart=no
+TimeoutStartSec=20
+TimeoutStopSec=10
+KillMode=mixed
+SendSIGKILL=yes
+
+# Vault sessions are intentionally bounded teaching environments.
+MemoryHigh=224M
+MemoryMax=256M
+MemorySwapMax=0
+CPUQuota=50%
+TasksMax=64
+LimitNOFILE=4096
+LimitNPROC=64
+LimitCORE=0
+LimitMEMLOCK=0
+OOMPolicy=stop
+
+# Filesystem and privilege isolation. The only writable host path is this slot.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=no
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @swap
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+# native-install.sh installs a fail-closed, instance-specific drop-in containing
+# the exact 127.77.0.<slot>/32 address.
+ReadOnlyPaths=/run/vault-lab/slots/%i
+ReadWritePaths=/var/lib/vault-lab/sessions/%i/data
+ReadWritePaths=/var/lib/vault-lab/sessions/%i/tmp
+BindPaths=/var/lib/vault-lab/sessions/%i/tmp:/tmp
+
+# Instances are started on demand by vault-lab-control, never enabled at boot.

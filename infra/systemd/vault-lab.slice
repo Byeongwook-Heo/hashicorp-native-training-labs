@@ -1,0 +1,12 @@
+[Unit]
+Description=Aggregate resource boundary for Vault Lab
+
+[Slice]
+CPUAccounting=yes
+CPUQuota=180%
+MemoryAccounting=yes
+MemoryHigh=2600M
+MemoryMax=3000M
+MemorySwapMax=0
+TasksAccounting=yes
+TasksMax=768

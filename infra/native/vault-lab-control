@@ -1,0 +1,979 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+umask 077
+
+readonly APP_USER="vault-lab"
+readonly STATE_ROOT="/var/lib/vault-lab/sessions"
+readonly RUNTIME_ROOT="/run/vault-lab/slots"
+readonly CONTROL_STAGING_ROOT="${RUNTIME_ROOT}/.control"
+readonly CONTROL_LOCK_ROOT="/run/lock/vault-lab-control"
+readonly SLOT_PATTERN='^s[0-9]{2}$'
+readonly SESSION_ID_PATTERN='^[a-f0-9]{32}$'
+readonly EXPIRY_PATTERN='^[0-9]{13}$'
+readonly ARTIFACT_PATTERN='^[a-z0-9][a-z0-9._-]{0,63}$'
+readonly MAX_ARTIFACT_BYTES=16777216
+readonly MAX_AUDIT_BYTES=67108864
+
+SLOT_LOCK_FD=
+SCOPE_UNIT=
+SCOPE_RUNNER_PID=
+SCOPE_OPERATION=
+SCOPE_STEP=
+SCOPE_SLOT=
+SCOPE_CLEANED=true
+declare -a FROZEN_TERMINALS=()
+
+die() {
+  echo "vault-lab-control: $*" >&2
+  exit 64
+}
+
+require_slot() {
+  local slot="${1:-}"
+  [[ "$slot" =~ $SLOT_PATTERN ]] || die "invalid slot"
+  local number="${slot#s}"
+  number=$((10#$number))
+  (( number >= 1 && number <= 99 )) || die "slot out of range"
+  id "vaultlab-${slot}" >/dev/null 2>&1 || die "slot user is not provisioned"
+  id "vaultverify-${slot}" >/dev/null 2>&1 || die "slot verifier is not provisioned"
+  id "vaultsvc-${slot}" >/dev/null 2>&1 || die "slot service user is not provisioned"
+}
+
+require_step() {
+  case "${1:-}" in
+    status|auth-list|secrets-list|enable-kv|write-v1|write-v2|read-v1|\
+    kv-soft-delete|kv-restore|policy-write|capabilities|limited-token|\
+    token-lookup|approle-enable|approle-role|approle-credentials|\
+    approle-login|transit-enable|transit-key|transit-encrypt|\
+    transit-decrypt|transit-rotate|audit-enable|audit-inspect|deny-drill|\
+    revoke-drill|pki-enable|pki-root|pki-role|pki-issue)
+      ;;
+    *)
+      die "unknown curriculum step"
+      ;;
+  esac
+}
+
+slot_loopback_address() {
+  local slot="$1"
+  local number="${slot#s}"
+  number=$((10#$number))
+  printf '127.77.0.%d' "$number"
+}
+
+acquire_slot_lock() {
+  local slot="$1"
+  [[ -d "$CONTROL_LOCK_ROOT" && ! -L "$CONTROL_LOCK_ROOT" ]] \
+    || die "control lock directory is unavailable"
+  exec {SLOT_LOCK_FD}>"${CONTROL_LOCK_ROOT}/${slot}.lock"
+  flock -x "$SLOT_LOCK_FD"
+}
+
+read_session_binding() {
+  local slot="$1"
+  local binding_path="${RUNTIME_ROOT}/${slot}/session-id"
+  local app_uid group_gid metadata binding
+  require_runtime_directory "$slot"
+  [[ -f "$binding_path" && ! -L "$binding_path" ]] \
+    || die "session binding is missing"
+  app_uid="$(id -u "$APP_USER")"
+  group_gid="$(getent group "vaultlab-${slot}" | cut -d: -f3)"
+  metadata="$(stat -c '%u:%g:%h:%a:%s' -- "$binding_path")"
+  [[ "$metadata" == "${app_uid}:${group_gid}:1:640:33" ]] \
+    || die "session binding metadata is unsafe"
+  IFS= read -r binding <"$binding_path" || die "session binding is unreadable"
+  [[ "$binding" =~ $SESSION_ID_PATTERN ]] || die "session binding is invalid"
+  printf '%s\n' "$binding"
+}
+
+require_session_binding() {
+  local slot="$1"
+  local expected="${2:-}"
+  [[ "$expected" =~ $SESSION_ID_PATTERN ]] || die "expected session binding is invalid"
+  [[ "$(read_session_binding "$slot")" == "$expected" ]] \
+    || die "stale session binding"
+}
+
+read_expiry() {
+  local slot="$1"
+  local expiry_path="${RUNTIME_ROOT}/${slot}/expires-at"
+  local app_uid group_gid metadata expiry
+  require_runtime_directory "$slot"
+  [[ -f "$expiry_path" && ! -L "$expiry_path" ]] || die "session expiry is missing"
+  app_uid="$(id -u "$APP_USER")"
+  group_gid="$(getent group "vaultlab-${slot}" | cut -d: -f3)"
+  metadata="$(stat -c '%u:%g:%h:%a:%s' -- "$expiry_path")"
+  [[ "$metadata" == "${app_uid}:${group_gid}:1:640:14" ]] \
+    || die "session expiry metadata is unsafe"
+  IFS= read -r expiry <"$expiry_path" || die "session expiry is unreadable"
+  [[ "$expiry" =~ $EXPIRY_PATTERN ]] || die "session expiry is invalid"
+  printf '%s\n' "$expiry"
+}
+
+scoped_units() {
+  local kind="$1"
+  local slot="$2"
+  local unit
+  while IFS= read -r unit; do
+    [[ "$unit" =~ ^vault-lab-${kind}-${slot}-[a-f0-9]{12}\.service$ ]] \
+      || continue
+    printf '%s\n' "$unit"
+  done < <(
+    systemctl list-units \
+      --all --full --plain --no-legend \
+      "vault-lab-${kind}-${slot}-*.service" |
+      awk '{ print $1 }'
+  )
+}
+
+stop_kind_units() {
+  local kind="$1"
+  local slot="$2"
+  local unit
+  while IFS= read -r unit; do
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+  done < <(scoped_units "$kind" "$slot")
+}
+
+stop_scoped_units() {
+  local slot="$1"
+  stop_kind_units terminal "$slot"
+  stop_kind_units exec "$slot"
+}
+
+freeze_terminals() {
+  local slot="$1"
+  local unit active_state
+  FROZEN_TERMINALS=()
+  while IFS= read -r unit; do
+    active_state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
+    case "$active_state" in
+      inactive|failed|"") continue ;;
+      active) ;;
+      *)
+        thaw_terminals
+        return 1
+        ;;
+    esac
+    if ! systemctl freeze "$unit" >/dev/null; then
+      thaw_terminals
+      return 1
+    fi
+    FROZEN_TERMINALS+=("$unit")
+    if [[ "$(systemctl show -p FreezerState --value "$unit" 2>/dev/null || true)" \
+        != "frozen" ]]; then
+      thaw_terminals
+      return 1
+    fi
+  done < <(scoped_units terminal "$slot")
+}
+
+thaw_terminals() {
+  local unit
+  for unit in "${FROZEN_TERMINALS[@]}"; do
+    systemctl thaw "$unit" >/dev/null 2>&1 || true
+  done
+  FROZEN_TERMINALS=()
+}
+
+require_slot_filesystem() {
+  local slot="$1"
+  local state_dir="${STATE_ROOT}/${slot}"
+  local marker="${state_dir}/.vault-lab-slot"
+  local mount_data
+
+  [[ -d "$state_dir" && ! -L "$state_dir" ]] \
+    || die "slot filesystem mountpoint is unavailable"
+  mount_data="$(findmnt -rn -M "$state_dir" -o TARGET,FSTYPE,OPTIONS)" \
+    || die "slot filesystem is not mounted"
+  [[ "$mount_data" == "${state_dir} ext4 "* ]] \
+    || die "slot filesystem mount is not the expected ext4 target"
+  for option in rw nodev nosuid noexec; do
+    [[ ",${mount_data#* ext4 }," == *",${option},"* ]] \
+      || die "slot filesystem is missing mount option ${option}"
+  done
+  [[ "$(stat -c '%u:%g:%a' -- "$state_dir")" == "0:0:711" ]] \
+    || die "slot filesystem root ownership is invalid"
+  [[ -f "$marker" && ! -L "$marker" ]] \
+    || die "slot filesystem marker is missing"
+  [[ "$(stat -c '%u:%g:%h:%a' -- "$marker")" == "0:0:1:400" ]] \
+    || die "slot filesystem marker metadata is invalid"
+  [[ "$(<"$marker")" == "vault-lab:${slot}:v1" ]] \
+    || die "slot filesystem marker content is invalid"
+}
+
+require_runtime_directory() {
+  local slot="$1"
+  local runtime_dir="${RUNTIME_ROOT}/${slot}"
+  local app_uid group_gid
+
+  app_uid="$(id -u "$APP_USER")"
+  group_gid="$(getent group "vaultlab-${slot}" | cut -d: -f3)"
+  [[ -d /run/vault-lab && ! -L /run/vault-lab \
+    && "$(stat -c '%u:%g:%a' /run/vault-lab)" == "0:0:711" ]] \
+    || die "runtime root parent metadata is unsafe"
+  [[ -d "$RUNTIME_ROOT" && ! -L "$RUNTIME_ROOT" \
+    && "$(stat -c '%u:%g:%a' "$RUNTIME_ROOT")" == "0:0:711" ]] \
+    || die "runtime root metadata is unsafe"
+  [[ -d "$runtime_dir" && ! -L "$runtime_dir" \
+    && "$(stat -c '%u:%g:%a' "$runtime_dir")" \
+      == "${app_uid}:${group_gid}:2750" ]] \
+    || die "slot runtime directory metadata is unsafe"
+  [[ -d "$CONTROL_STAGING_ROOT" && ! -L "$CONTROL_STAGING_ROOT" \
+    && "$(stat -c '%u:%g:%a' "$CONTROL_STAGING_ROOT")" == "0:0:700" ]] \
+    || die "control staging directory metadata is unsafe"
+  [[ "$(stat -c %d "$runtime_dir")" == "$(stat -c %d "$CONTROL_STAGING_ROOT")" \
+    && "$(stat -c %m "$runtime_dir")" \
+      == "$(stat -c %m "$CONTROL_STAGING_ROOT")" ]] \
+    || die "runtime and control staging directories cross mount boundaries"
+}
+
+reset_slot_subdirectory() {
+  local slot="$1"
+  local name="$2"
+  local mode="$3"
+  local owner="${4:-vaultlab-${slot}}"
+  local slot_user="vaultlab-${slot}"
+  local state_dir="${STATE_ROOT}/${slot}"
+  local directory="${state_dir}/${name}"
+
+  case "$name" in
+    data|home|tmp) ;;
+    *) die "invalid slot subdirectory" ;;
+  esac
+  if [[ -e "$directory" || -L "$directory" ]]; then
+    [[ -d "$directory" && ! -L "$directory" ]] \
+      || die "unsafe slot subdirectory"
+    [[ "$(stat -c %d -- "$directory")" == "$(stat -c %d -- "$state_dir")" ]] \
+      || die "slot subdirectory crosses a filesystem boundary"
+    rm -rf --one-file-system -- "$directory"
+  fi
+  install -d -o "$owner" -g "$slot_user" -m "$mode" "$directory"
+}
+
+prepare_slot_locked() {
+  local slot="$1"
+  local slot_user="vaultlab-${slot}"
+  local runtime_dir="${RUNTIME_ROOT}/${slot}"
+
+  stop_scoped_units "$slot"
+  systemctl stop "vault-lab@${slot}.service" >/dev/null 2>&1 || true
+  systemctl reset-failed "vault-lab@${slot}.service" >/dev/null 2>&1 || true
+  require_slot_filesystem "$slot"
+
+  reset_slot_subdirectory "$slot" data 0700 "vaultsvc-${slot}"
+  reset_slot_subdirectory "$slot" home 0770
+  reset_slot_subdirectory "$slot" tmp 3770 root
+  install \
+    -o "vaultsvc-${slot}" \
+    -g "$slot_user" \
+    -m 0640 \
+    /dev/null \
+    "${STATE_ROOT}/${slot}/tmp/vault-audit.log"
+
+  rm -rf --one-file-system -- "$runtime_dir"
+  install -d -o "$APP_USER" -g "$slot_user" -m 2750 "$runtime_dir"
+  require_runtime_directory "$slot"
+}
+
+prepare_slot() {
+  local slot="$1"
+  acquire_slot_lock "$slot"
+  prepare_slot_locked "$slot"
+}
+
+write_expiry_guard() {
+  local slot="$1"
+  local expected_session="${2:-}"
+  local new_expiry="${3:-}"
+  local runtime_dir="${RUNTIME_ROOT}/${slot}"
+  local expiry_path="${runtime_dir}/expires-at"
+  local temporary now maximum_expiry
+  [[ "$expected_session" =~ $SESSION_ID_PATTERN ]] \
+    || die "expected session binding is invalid"
+  [[ "$new_expiry" =~ $EXPIRY_PATTERN ]] || die "new session expiry is invalid"
+  now="$(( $(date +%s) * 1000 ))"
+  maximum_expiry="$((now + 24 * 60 * 60 * 1000))"
+  (( 10#$new_expiry <= maximum_expiry )) || die "new session expiry is too far in the future"
+
+  require_slot_filesystem "$slot"
+  acquire_slot_lock "$slot"
+  require_runtime_directory "$slot"
+  require_session_binding "$slot" "$expected_session"
+  temporary="$(mktemp "${CONTROL_STAGING_ROOT}/.${slot}.expires-at.XXXXXX")"
+  if ! {
+    printf '%s\n' "$new_expiry" >"$temporary"
+    chown "$APP_USER:vaultlab-${slot}" "$temporary"
+    chmod 0640 "$temporary"
+    sync -f "$temporary"
+    /usr/bin/python3 -I -S - \
+      "$CONTROL_STAGING_ROOT" \
+      "$(basename -- "$temporary")" \
+      "$runtime_dir" <<'PY'
+import os
+import stat
+import sys
+
+staging_path, source_name, destination_path = sys.argv[1:]
+if "/" in source_name or not source_name.startswith(".s"):
+    raise SystemExit("unsafe expiry staging name")
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+source_directory = os.open(staging_path, directory_flags)
+destination_directory = os.open(destination_path, directory_flags)
+try:
+    source = os.stat(
+        source_name,
+        dir_fd=source_directory,
+        follow_symlinks=False,
+    )
+    destination = os.fstat(destination_directory)
+    if (
+        not stat.S_ISREG(source.st_mode)
+        or source.st_nlink != 1
+        or stat.S_IMODE(source.st_mode) != 0o640
+        or source.st_uid != destination.st_uid
+        or source.st_gid != destination.st_gid
+    ):
+        raise SystemExit("unsafe expiry staging metadata")
+    os.rename(
+        source_name,
+        "expires-at",
+        src_dir_fd=source_directory,
+        dst_dir_fd=destination_directory,
+    )
+    committed = os.stat(
+        "expires-at",
+        dir_fd=destination_directory,
+        follow_symlinks=False,
+    )
+    if committed.st_dev != source.st_dev or committed.st_ino != source.st_ino:
+        raise SystemExit("expiry rename did not commit the staged inode")
+    os.fsync(source_directory)
+    os.fsync(destination_directory)
+finally:
+    os.close(destination_directory)
+    os.close(source_directory)
+PY
+  }; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  [[ "$(read_expiry "$slot")" == "$new_expiry" ]] \
+    || die "session expiry guard verification failed"
+}
+
+reap_slot() {
+  local slot="$1"
+  local expected_session="${2:-}"
+  local expected_expiry="${3:-}"
+  local current_session current_expiry now
+  [[ "$expected_session" =~ $SESSION_ID_PATTERN ]] \
+    || die "expected session binding is invalid"
+  [[ "$expected_expiry" =~ $EXPIRY_PATTERN ]] \
+    || die "expected session expiry is invalid"
+
+  require_slot_filesystem "$slot"
+  acquire_slot_lock "$slot"
+  if [[ ! -e "${RUNTIME_ROOT}/${slot}/session-id" \
+    && ! -L "${RUNTIME_ROOT}/${slot}/session-id" ]]; then
+    return 0
+  fi
+  if [[ ! -e "${RUNTIME_ROOT}/${slot}/expires-at" \
+    && ! -L "${RUNTIME_ROOT}/${slot}/expires-at" ]]; then
+    return 0
+  fi
+  current_session="$(read_session_binding "$slot")"
+  [[ "$current_session" == "$expected_session" ]] || return 0
+  current_expiry="$(read_expiry "$slot")"
+  [[ "$current_expiry" == "$expected_expiry" ]] || return 0
+  now="$(( $(date +%s) * 1000 ))"
+  (( 10#$current_expiry <= now )) || return 0
+  prepare_slot_locked "$slot"
+}
+
+new_unit_suffix() {
+  local uuid
+  IFS= read -r uuid </proc/sys/kernel/random/uuid
+  uuid="${uuid//-/}"
+  printf '%.12s' "$uuid"
+}
+
+scope_properties() {
+  local slot="$1"
+  local runtime_max="$2"
+  local state_dir="${STATE_ROOT}/${slot}"
+  local slot_address
+  slot_address="$(slot_loopback_address "$slot")"
+
+  printf '%s\n' \
+    "--property=UMask=0077" \
+    "--property=WorkingDirectory=${state_dir}/home" \
+    "--property=RuntimeMaxSec=${runtime_max}" \
+    "--property=TimeoutStopSec=5" \
+    "--property=KillMode=mixed" \
+    "--property=SendSIGKILL=yes" \
+    "--property=MemoryHigh=96M" \
+    "--property=MemoryMax=128M" \
+    "--property=MemorySwapMax=0" \
+    "--property=CPUQuota=50%" \
+    "--property=TasksMax=32" \
+    "--property=LimitNOFILE=1024" \
+    "--property=LimitNPROC=32" \
+    "--property=LimitCORE=0" \
+    "--property=NoNewPrivileges=yes" \
+    "--property=CapabilityBoundingSet=" \
+    "--property=AmbientCapabilities=" \
+    "--property=ProtectSystem=strict" \
+    "--property=ProtectHome=yes" \
+    "--property=PrivateDevices=yes" \
+    "--property=ProtectKernelTunables=yes" \
+    "--property=ProtectKernelModules=yes" \
+    "--property=ProtectKernelLogs=yes" \
+    "--property=ProtectControlGroups=yes" \
+    "--property=ProtectClock=yes" \
+    "--property=ProtectHostname=yes" \
+    "--property=ProtectProc=invisible" \
+    "--property=ProcSubset=pid" \
+    "--property=RestrictNamespaces=yes" \
+    "--property=RestrictRealtime=yes" \
+    "--property=RestrictSUIDSGID=yes" \
+    "--property=LockPersonality=yes" \
+    "--property=MemoryDenyWriteExecute=yes" \
+    "--property=RemoveIPC=yes" \
+    "--property=SystemCallArchitectures=native" \
+    "--property=SystemCallErrorNumber=EPERM" \
+    "--property=SystemCallFilter=@system-service" \
+    "--property=SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @swap" \
+    "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" \
+    "--property=IPAddressDeny=any" \
+    "--property=IPAddressAllow=${slot_address}/32" \
+    "--property=ReadOnlyPaths=${RUNTIME_ROOT}/${slot}" \
+    "--property=ReadWritePaths=${state_dir}/home ${state_dir}/tmp" \
+    "--property=InaccessiblePaths=${state_dir}/data" \
+    "--property=BindPaths=${state_dir}/tmp:/tmp"
+}
+
+artifact_contract() {
+  local operation="$1"
+  local phase="$2"
+  local step="$3"
+  case "${operation}:${phase}:${step}" in
+    verify:pre:policy-write|verify:post:policy-write)
+      printf '%s\n' app-read.hcl ;;
+    verify:pre:limited-token|verify:post:limited-token)
+      printf '%s\n' app-token.json ;;
+    verify:pre:token-lookup|verify:post:token-lookup)
+      printf '%s\n' app-token.json token-audit.json ;;
+    verify:pre:approle-credentials|verify:post:approle-credentials)
+      printf '%s\n' role-id secret-id secret-id.json ;;
+    verify:pre:approle-login|verify:post:approle-login)
+      printf '%s\n' approle-login.json ;;
+    verify:pre:transit-encrypt|verify:post:transit-encrypt)
+      printf '%s\n' ciphertext ;;
+    verify:pre:transit-decrypt|verify:post:transit-decrypt)
+      printf '%s\n' ciphertext decrypted.txt ;;
+    verify:pre:transit-rotate|verify:post:transit-rotate)
+      printf '%s\n' ciphertext-v2 ;;
+    verify:pre:audit-inspect|verify:post:audit-inspect)
+      printf '%s\n' audit-trace.jsonl ;;
+    verify:pre:deny-drill|verify:post:deny-drill)
+      printf '%s\n' denied.out deny-proof.json ;;
+    verify:pre:revoke-drill|verify:post:revoke-drill)
+      printf '%s\n' revoked-token revoked-accessor revoked-proof.json ;;
+    verify:pre:pki-issue|verify:post:pki-issue)
+      printf '%s\n' api-cert.json ;;
+
+    skip:pre:policy-write|skip:pre:capabilities|\
+    skip:pre:approle-role)
+      printf '%s\n' app-read.hcl ;;
+    skip:pre:limited-token)
+      printf '%s\n' app-read.hcl app-token.json ;;
+    skip:pre:token-lookup)
+      printf '%s\n' app-read.hcl app-token.json token-audit.json ;;
+    skip:pre:approle-credentials)
+      printf '%s\n' app-read.hcl role-id secret-id.json secret-id ;;
+    skip:pre:approle-login)
+      printf '%s\n' app-read.hcl role-id secret-id.json secret-id approle-login.json ;;
+    skip:pre:transit-encrypt)
+      printf '%s\n' ciphertext ;;
+    skip:pre:transit-decrypt)
+      printf '%s\n' ciphertext decrypted.txt ;;
+    skip:pre:transit-rotate)
+      printf '%s\n' ciphertext ciphertext-v2 ;;
+    skip:pre:audit-inspect)
+      printf '%s\n' audit-trace.jsonl ;;
+    skip:pre:deny-drill)
+      printf '%s\n' app-read.hcl denied.out deny-proof.json ;;
+    skip:pre:revoke-drill)
+      printf '%s\n' app-read.hcl revoked-token revoked-accessor revoked-proof.json ;;
+    skip:pre:pki-issue)
+      printf '%s\n' api-cert.json ;;
+
+    skip:post:policy-write|skip:post:capabilities|skip:post:approle-role)
+      printf '%s\n' app-read.hcl ;;
+    skip:post:limited-token)
+      printf '%s\n' app-read.hcl app-token.json ;;
+    skip:post:token-lookup)
+      printf '%s\n' app-read.hcl app-token.json token-audit.json ;;
+    skip:post:approle-credentials)
+      printf '%s\n' app-read.hcl role-id secret-id.json secret-id ;;
+    skip:post:approle-login)
+      printf '%s\n' app-read.hcl role-id secret-id.json secret-id approle-login.json ;;
+    skip:post:transit-encrypt)
+      printf '%s\n' ciphertext ;;
+    skip:post:transit-decrypt)
+      printf '%s\n' ciphertext decrypted.txt ;;
+    skip:post:transit-rotate)
+      printf '%s\n' ciphertext ciphertext-v2 ;;
+    skip:post:audit-inspect)
+      printf '%s\n' audit-trace.jsonl ;;
+    skip:post:deny-drill)
+      printf '%s\n' app-read.hcl denied.out deny-proof.json ;;
+    skip:post:revoke-drill)
+      printf '%s\n' app-read.hcl revoked-token revoked-accessor revoked-proof.json ;;
+    skip:post:pki-issue)
+      printf '%s\n' api-cert.json ;;
+  esac
+}
+
+handoff_artifact() {
+  local slot="$1"
+  local artifact="$2"
+  local source_user="$3"
+  local target_user="$4"
+  local required="$5"
+  local state_dir="${STATE_ROOT}/${slot}"
+  local artifact_path="${state_dir}/tmp/${artifact}"
+  local slot_group="vaultlab-${slot}"
+  local source_uid target_uid group_gid metadata size
+
+  [[ "$artifact" =~ $ARTIFACT_PATTERN ]] \
+    || { echo "vault-lab-control: unsafe artifact name" >&2; return 1; }
+  case "$artifact" in
+    root-token|student-token|vault-token|pki-cert.*|pki-key.*|pki-ca.*)
+      echo "vault-lab-control: forbidden artifact" >&2
+      return 1
+      ;;
+  esac
+  if [[ ! -e "$artifact_path" && ! -L "$artifact_path" ]]; then
+    [[ "$required" == "false" ]] && return 0
+    echo "vault-lab-control: required artifact is missing" >&2
+    return 1
+  fi
+  [[ -f "$artifact_path" && ! -L "$artifact_path" ]] \
+    || { echo "vault-lab-control: artifact is not a regular file" >&2; return 1; }
+  source_uid="$(id -u "$source_user")"
+  target_uid="$(id -u "$target_user")"
+  group_gid="$(getent group "$slot_group" | cut -d: -f3)"
+  metadata="$(stat -c '%u:%g:%h:%a' -- "$artifact_path")"
+  [[ "$metadata" == "${source_uid}:${group_gid}:1:600" ]] \
+    || { echo "vault-lab-control: artifact metadata is unsafe" >&2; return 1; }
+  size="$(stat -c %s -- "$artifact_path")"
+  (( size <= MAX_ARTIFACT_BYTES )) \
+    || { echo "vault-lab-control: artifact is too large" >&2; return 1; }
+
+  chown --no-dereference "${target_uid}:${group_gid}" -- "$artifact_path" \
+    || return 1
+  chmod 0600 -- "$artifact_path" || return 1
+  [[ "$(stat -c '%u:%g:%h:%a' -- "$artifact_path")" \
+      == "${target_uid}:${group_gid}:1:600" ]] \
+    || { echo "vault-lab-control: artifact handoff verification failed" >&2; return 1; }
+}
+
+validate_audit_log_access() {
+  local slot="$1"
+  local path="${STATE_ROOT}/${slot}/tmp/vault-audit.log"
+  local service_user="vaultsvc-${slot}"
+  local slot_group="vaultlab-${slot}"
+  local uid gid metadata size
+
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    echo "vault-lab-control: audit log is missing" >&2
+    return 1
+  fi
+  [[ -f "$path" && ! -L "$path" ]] \
+    || { echo "vault-lab-control: audit log is not a regular file" >&2; return 1; }
+  uid="$(id -u "$service_user")"
+  gid="$(getent group "$slot_group" | cut -d: -f3)"
+  metadata="$(stat -c '%u:%g:%h:%a' -- "$path")"
+  [[ "$metadata" == "${uid}:${gid}:1:640" ]] \
+    || { echo "vault-lab-control: audit log metadata is unsafe" >&2; return 1; }
+  size="$(stat -c %s -- "$path")"
+  (( size <= MAX_AUDIT_BYTES )) \
+    || { echo "vault-lab-control: audit log is too large" >&2; return 1; }
+}
+
+handoff_phase() {
+  local slot="$1"
+  local operation="$2"
+  local phase="$3"
+  local step="$4"
+  local source_user target_user required artifact
+  local status=0
+
+  if [[ "$phase" == "pre" ]]; then
+    source_user="vaultlab-${slot}"
+    target_user="vaultverify-${slot}"
+    required=false
+  else
+    source_user="vaultverify-${slot}"
+    target_user="vaultlab-${slot}"
+    required=true
+  fi
+  while IFS= read -r artifact; do
+    [[ -n "$artifact" ]] || continue
+    handoff_artifact \
+      "$slot" "$artifact" "$source_user" "$target_user" "$required" \
+      || status=1
+  done < <(artifact_contract "$operation" "$phase" "$step")
+
+  if [[ "$step" == "audit-inspect" ]]; then
+    validate_audit_log_access "$slot" || status=1
+  fi
+  return "$status"
+}
+
+cleanup_command_scope() {
+  local status=0
+  [[ "$SCOPE_CLEANED" == "false" ]] || return 0
+  SCOPE_CLEANED=true
+  set +e
+  if [[ -n "$SCOPE_UNIT" ]]; then
+    systemctl stop "$SCOPE_UNIT" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$SCOPE_RUNNER_PID" ]]; then
+    kill -TERM "$SCOPE_RUNNER_PID" >/dev/null 2>&1 || true
+    wait "$SCOPE_RUNNER_PID" >/dev/null 2>&1 || true
+    SCOPE_RUNNER_PID=
+  fi
+  if [[ -n "$SCOPE_SLOT" && -n "$SCOPE_OPERATION" && -n "$SCOPE_STEP" ]]; then
+    handoff_phase "$SCOPE_SLOT" "$SCOPE_OPERATION" post "$SCOPE_STEP" \
+      || status=1
+  fi
+  thaw_terminals
+  return "$status"
+}
+
+command_signal() {
+  exit 143
+}
+
+run_command() {
+  local slot="$1"
+  local expected_session="${2:-}"
+  local operation="${3:-}"
+  local step="${4:-}"
+  shift 4 || die "command requires session, operation, and step"
+  [[ "$expected_session" =~ $SESSION_ID_PATTERN ]] \
+    || die "expected session binding is invalid"
+  [[ "$operation" == "verify" || "$operation" == "skip" ]] \
+    || die "command operation must be verify or skip"
+  require_step "$step"
+  [[ "${1:-}" == "--" ]] || die "command separator is missing"
+  shift
+  (( $# > 0 )) || die "missing command"
+
+  local slot_user="vaultlab-${slot}"
+  local verifier_user="vaultverify-${slot}"
+  local unit runner_status cleanup_status=0
+  local -a properties=()
+  unit="vault-lab-exec-${slot}-$(new_unit_suffix)"
+  mapfile -t properties < <(scope_properties "$slot" 30)
+
+  require_slot_filesystem "$slot"
+  acquire_slot_lock "$slot"
+  require_session_binding "$slot" "$expected_session"
+  [[ -s "${RUNTIME_ROOT}/${slot}/root-token" ]] || die "slot is not initialized"
+  [[ -s "${RUNTIME_ROOT}/${slot}/address" ]] || die "slot has no address metadata"
+  stop_kind_units exec "$slot"
+  freeze_terminals "$slot" || die "could not freeze the learner terminal"
+  if ! handoff_phase "$slot" "$operation" pre "$step"; then
+    handoff_phase "$slot" "$operation" post "$step" >/dev/null 2>&1 || true
+    thaw_terminals
+    die "artifact handoff failed"
+  fi
+
+  SCOPE_UNIT="$unit"
+  SCOPE_OPERATION="$operation"
+  SCOPE_STEP="$step"
+  SCOPE_SLOT="$slot"
+  SCOPE_CLEANED=false
+  trap command_signal HUP INT TERM
+  trap cleanup_command_scope EXIT
+
+  systemd-run \
+    --quiet --collect --wait --pipe --service-type=exec \
+    "--unit=${unit}" \
+    "--uid=${verifier_user}" "--gid=${slot_user}" \
+    "${properties[@]}" \
+    "--property=LoadCredential=vault-token:${RUNTIME_ROOT}/${slot}/root-token" \
+    -- \
+    /usr/local/libexec/vault-lab-exec "$slot" "$@" &
+  SCOPE_RUNNER_PID=$!
+  if wait "$SCOPE_RUNNER_PID"; then
+    runner_status=0
+  else
+    runner_status=$?
+  fi
+  SCOPE_RUNNER_PID=
+  cleanup_command_scope || cleanup_status=$?
+  trap - EXIT HUP INT TERM
+  (( cleanup_status == 0 )) || return 65
+  return "$runner_status"
+}
+
+cleanup_terminal_scope() {
+  [[ "$SCOPE_CLEANED" == "false" ]] || return 0
+  SCOPE_CLEANED=true
+  set +e
+  if [[ -n "$SCOPE_UNIT" ]]; then
+    systemctl stop "$SCOPE_UNIT" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$SCOPE_RUNNER_PID" ]]; then
+    kill -TERM "$SCOPE_RUNNER_PID" >/dev/null 2>&1 || true
+    wait "$SCOPE_RUNNER_PID" >/dev/null 2>&1 || true
+    SCOPE_RUNNER_PID=
+  fi
+}
+
+terminal_signal() {
+  exit 143
+}
+
+run_terminal() {
+  local slot="$1"
+  local expected_session="$2"
+  local runtime_max="$3"
+  local slot_user="vaultlab-${slot}"
+  local unit runner_status registered=false terminal_input_fd
+  local -a properties=()
+  unit="vault-lab-terminal-${slot}-$(new_unit_suffix)"
+  mapfile -t properties < <(scope_properties "$slot" "$runtime_max")
+
+  require_slot_filesystem "$slot"
+  acquire_slot_lock "$slot"
+  require_session_binding "$slot" "$expected_session"
+  [[ -s "${RUNTIME_ROOT}/${slot}/student-token" ]] || die "slot is not initialized"
+  [[ -s "${RUNTIME_ROOT}/${slot}/port" ]] || die "slot has no port metadata"
+  [[ -s "${RUNTIME_ROOT}/${slot}/address" ]] || die "slot has no address metadata"
+  stop_kind_units terminal "$slot"
+
+  SCOPE_UNIT="$unit"
+  SCOPE_CLEANED=false
+  trap terminal_signal HUP INT TERM
+  trap cleanup_terminal_scope EXIT
+
+  exec {terminal_input_fd}<&0
+  systemd-run \
+    --quiet --collect --wait --pipe --service-type=exec \
+    "--unit=${unit}" \
+    "--uid=${slot_user}" "--gid=${slot_user}" \
+    "${properties[@]}" \
+    -- \
+    /usr/bin/script -qefc "/usr/local/libexec/vault-lab-shell ${slot}" /dev/null \
+    <&"$terminal_input_fd" &
+  SCOPE_RUNNER_PID=$!
+  exec {terminal_input_fd}<&-
+  for _ in {1..100}; do
+    if [[ "$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)" \
+        == "active" ]]; then
+      registered=true
+      break
+    fi
+    kill -0 "$SCOPE_RUNNER_PID" 2>/dev/null || break
+    sleep 0.02
+  done
+  flock -u "$SLOT_LOCK_FD"
+  [[ "$registered" == "true" ]] || {
+    cleanup_terminal_scope
+    wait "$SCOPE_RUNNER_PID" >/dev/null 2>&1 || true
+    die "terminal unit did not start"
+  }
+
+  if wait "$SCOPE_RUNNER_PID"; then
+    runner_status=0
+  else
+    runner_status=$?
+  fi
+  SCOPE_RUNNER_PID=
+  cleanup_terminal_scope
+  trap - EXIT HUP INT TERM
+  return "$runner_status"
+}
+
+terminal_count() {
+  local slot="$1"
+  local count=0
+  local unit
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    count=$((count + 1))
+  done < <(scoped_units terminal "$slot")
+  printf '%d\n' "$count"
+}
+
+probe_learner_port() {
+  local slot="$1"
+  local slot_user="vaultlab-${slot}"
+  local address unit
+  local -a properties=()
+  address="$(slot_loopback_address "$slot")"
+  unit="vault-lab-exec-${slot}-$(new_unit_suffix)"
+  mapfile -t properties < <(scope_properties "$slot" 10)
+  [[ -x /usr/bin/python3 ]] || die "Python 3 is unavailable"
+
+  acquire_slot_lock "$slot"
+  stop_kind_units exec "$slot"
+  systemd-run \
+    --quiet --collect --wait --pipe --service-type=exec \
+    "--unit=${unit}" \
+    "--uid=${slot_user}" "--gid=${slot_user}" \
+    "${properties[@]}" \
+    -- \
+    /usr/bin/python3 -c '
+import errno
+import socket
+import sys
+
+server = socket.socket()
+try:
+    server.bind((sys.argv[1], 820))
+except PermissionError:
+    sys.exit(0)
+except OSError as error:
+    sys.exit(0 if error.errno in (errno.EACCES, errno.EPERM) else 2)
+else:
+    server.close()
+    sys.exit(3)
+    ' "$address"
+}
+
+probe_learner_signal() {
+  local slot="$1"
+  local slot_user="vaultlab-${slot}"
+  local service_pid current_pid unit
+  local -a properties=()
+  unit="vault-lab-exec-${slot}-$(new_unit_suffix)"
+  mapfile -t properties < <(scope_properties "$slot" 10)
+  [[ -x /usr/bin/python3 ]] || die "Python 3 is unavailable"
+  [[ "$(systemctl show -p ActiveState --value "vault-lab@${slot}.service")" \
+      == "active" ]] || die "slot service is not active"
+  service_pid="$(
+    systemctl show -p MainPID --value "vault-lab@${slot}.service"
+  )"
+  [[ "$service_pid" =~ ^[0-9]+$ && "$service_pid" -gt 1 ]] \
+    || die "slot service PID is invalid"
+
+  acquire_slot_lock "$slot"
+  stop_kind_units exec "$slot"
+  systemd-run \
+    --quiet --collect --wait --pipe --service-type=exec \
+    "--unit=${unit}" \
+    "--uid=${slot_user}" "--gid=${slot_user}" \
+    "${properties[@]}" \
+    -- \
+    /usr/bin/python3 -c '
+import os
+import sys
+
+try:
+    pid = int(sys.argv[1])
+except ValueError:
+    sys.exit(4)
+if pid <= 1:
+    sys.exit(4)
+try:
+    os.kill(pid, 0)
+except PermissionError:
+    sys.exit(0)
+except ProcessLookupError:
+    sys.exit(3)
+except OSError:
+    sys.exit(5)
+else:
+    sys.exit(2)
+    ' "$service_pid"
+  current_pid="$(
+    systemctl show -p MainPID --value "vault-lab@${slot}.service"
+  )"
+  [[ "$current_pid" == "$service_pid" ]] \
+    || die "slot service changed during learner signal probe"
+}
+
+(( $# >= 2 )) || die "usage: vault-lab-control ACTION SLOT [ARG...]"
+readonly requested_action="$1"
+readonly requested_slot="$2"
+shift 2
+require_slot "$requested_slot"
+
+case "$requested_action" in
+  prepare)
+    (( $# == 0 )) || die "prepare accepts no extra arguments"
+    prepare_slot "$requested_slot"
+    ;;
+  start)
+    (( $# == 0 )) || die "start accepts no extra arguments"
+    require_slot_filesystem "$requested_slot"
+    [[ -s "${RUNTIME_ROOT}/${requested_slot}/vault.hcl" ]] || die "slot config is missing"
+    systemctl start "vault-lab@${requested_slot}.service"
+    ;;
+  stop)
+    (( $# == 0 )) || die "stop accepts no extra arguments"
+    acquire_slot_lock "$requested_slot"
+    stop_scoped_units "$requested_slot"
+    systemctl stop "vault-lab@${requested_slot}.service"
+    ;;
+  status)
+    (( $# == 0 )) || die "status accepts no extra arguments"
+    systemctl is-active "vault-lab@${requested_slot}.service"
+    ;;
+  service-pid)
+    (( $# == 0 )) || die "service-pid accepts no extra arguments"
+    [[ "$(systemctl show -p ActiveState --value "vault-lab@${requested_slot}.service")" \
+        == "active" ]] || die "slot service is not active"
+    service_pid="$(
+      systemctl show -p MainPID --value "vault-lab@${requested_slot}.service"
+    )"
+    [[ "$service_pid" =~ ^[0-9]+$ && "$service_pid" -gt 1 ]] \
+      || die "slot service PID is invalid"
+    printf '%s\n' "$service_pid"
+    ;;
+  terminal)
+    (( $# == 2 )) || die "terminal requires a session binding and lifetime"
+    [[ "$1" =~ $SESSION_ID_PATTERN ]] || die "invalid terminal session binding"
+    [[ "$2" =~ ^[0-9]+$ ]] || die "invalid terminal lifetime"
+    (( 10#$2 >= 1 && 10#$2 <= 86400 )) || die "terminal lifetime out of range"
+    run_terminal "$requested_slot" "$1" "$((10#$2))"
+    ;;
+  terminal-count)
+    (( $# == 0 )) || die "terminal-count accepts no extra arguments"
+    terminal_count "$requested_slot"
+    ;;
+  learner-port-probe)
+    (( $# == 0 )) || die "learner-port-probe accepts no extra arguments"
+    probe_learner_port "$requested_slot"
+    ;;
+  learner-signal-probe)
+    (( $# == 0 )) || die "learner-signal-probe accepts no extra arguments"
+    probe_learner_signal "$requested_slot"
+    ;;
+  extend-guard)
+    (( $# == 2 )) || die "extend-guard requires session binding and expiry"
+    write_expiry_guard "$requested_slot" "$1" "$2"
+    ;;
+  reap)
+    (( $# == 2 )) || die "reap requires session binding and expiry"
+    reap_slot "$requested_slot" "$1" "$2"
+    ;;
+  command)
+    (( $# >= 5 )) \
+      || die "command requires session, operation, step, separator, and argv"
+    run_command "$requested_slot" "$@"
+    ;;
+  *)
+    die "unsupported action"
+    ;;
+esac

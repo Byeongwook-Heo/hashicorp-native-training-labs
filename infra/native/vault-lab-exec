@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly SLOT_PATTERN='^s[0-9]{2}$'
+readonly slot="${1:-}"
+[[ "$slot" =~ $SLOT_PATTERN ]] || exit 64
+shift
+(( $# > 0 )) || exit 64
+
+readonly runtime_dir="/run/vault-lab/slots/${slot}"
+readonly home_dir="/var/lib/vault-lab/sessions/${slot}/home"
+readonly credential_file="${CREDENTIALS_DIRECTORY:-}/vault-token"
+IFS= read -r vault_port <"${runtime_dir}/port"
+IFS= read -r vault_address <"${runtime_dir}/address"
+[[ -n "${CREDENTIALS_DIRECTORY:-}" && -f "$credential_file" ]] || exit 65
+IFS= read -r vault_token <"$credential_file"
+[[ "$vault_port" == "820" ]] || exit 65
+readonly slot_number="$((10#${slot#s}))"
+[[ "$vault_address" == "127.77.0.${slot_number}" ]] || exit 65
+[[ -n "$vault_token" ]] || exit 65
+
+export HOME="$home_dir"
+export TMPDIR="/tmp"
+export VAULT_ADDR="http://${vault_address}:${vault_port}"
+export VAULT_TOKEN="$vault_token"
+export LANG="C.UTF-8"
+export PATH="/usr/local/bin:/usr/bin:/bin"
+umask 077
+cd "$home_dir"
+exec "$@"

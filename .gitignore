@@ -1,0 +1,25 @@
+node_modules/
+dist/
+dist-server/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+*.tsbuildinfo
+qa-*.png
+data/
+.playwright-cli/
+.codex-admin-preview/
+
+# Private runtime material: keep example configuration only
+private/
+*.key
+*.pem
+*.hclic
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+!*.tfvars.example

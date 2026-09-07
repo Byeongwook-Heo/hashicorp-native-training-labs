@@ -1,0 +1,184 @@
+version: 4
+updatedAt: "2026-08-14"
+tracks:
+  - id: vault-foundations
+    title: Vault 네이티브 실무 랩
+    summary: Vault 2.x의 file storage 상태부터 KV v2, Policy, 제한 Token, AppRole, Transit, Audit, PKI까지 30개 검증 단계로 익힙니다.
+    level: 입문-중급
+    durationMinutes: 145
+    delivery: native
+    readiness: active
+    outcomes:
+      - native Vault의 초기화·unseal·file storage 상태 해석
+      - CAS, soft delete, undelete를 포함한 KV v2 수명주기 운영
+      - 정확한 ACL Policy와 제한 Token Role 기반 최소 권한 검증
+      - AppRole SecretID 제약과 Transit rotate·rewrap 수행
+      - 감사 이벤트 상관분석과 PKI 인증서의 암호학적 검증
+    requirements:
+      - Vault 2.x CLI
+      - jq
+      - openssl
+
+  - id: terraform-foundations
+    title: Terraform 네이티브 실무 랩
+    summary: Terraform 1.15의 HCL, provider, plan·apply, state·drift, module·test, Agent Skills, 민감 값과 운영 워크플로를 34개 서버 검증 단계로 익힙니다.
+    level: 입문-중급
+    durationMinutes: 225
+    delivery: dedicated
+    readiness: active
+    outcomes:
+      - HCL 구성과 provider dependency lock의 재현 가능한 초기화
+      - saved plan 기반 apply와 멱등성 검증
+      - state·drift·backup·제한된 destroy 운영
+      - for_each·count·dependency graph와 module contract 설계
+      - terraform test·moved block·민감 state·운영 워크플로 적용
+      - 고정된 HashiCorp Agent Skills 16개의 기능 이해, project-local 설치와 offline 결과 검증
+    requirements:
+      - Terraform 1.15.8 CLI
+      - root-owned offline provider mirror
+      - root-owned HashiCorp Agent Skills Unreleased main commit snapshot
+      - jq
+
+  - id: operations-and-audit
+    title: 운영·감사·장애 대응
+    summary: Audit Device, 권한 거부, Token accessor 폐기를 이용해 실제 운영 사고를 진단합니다.
+    level: 중급
+    durationMinutes: 45
+    delivery: native
+    readiness: ready
+    outcomes:
+      - 감사 로그 활성화와 민감정보 HMAC 해석
+      - 접근 거부와 토큰 폐기 시나리오 진단
+      - request.id 기반 request·response 이벤트 상관분석
+    requirements: []
+
+  - id: pki-secrets-engine
+    title: PKI 인증서 자동화
+    summary: 내부 CA, 안전한 발급 역할, 단기 인증서 발급과 암호학적 검증을 실습합니다.
+    level: 중급
+    durationMinutes: 50
+    delivery: native
+    readiness: ready
+    outcomes:
+      - 내부 Root CA와 발급 역할 구성
+      - TTL이 제한된 인증서 발급
+      - Subject·SAN·체인·Private Key 일치 검증
+    requirements:
+      - openssl
+
+  - id: ssh-certificate
+    title: SSH Certificate 인증
+    summary: Vault를 SSH CA로 구성하고 사용자 공개키에 짧은 수명의 인증서를 서명합니다.
+    level: 중급
+    durationMinutes: 40
+    delivery: native
+    readiness: ready
+    outcomes:
+      - SSH Client Signer 구성
+      - 역할 기반 Principal과 TTL 제한
+      - 인증서 서명과 속성 검증
+    requirements:
+      - openssh-clients
+
+  - id: database-dynamic-credentials
+    title: Database 동적 자격 증명
+    summary: PostgreSQL 역할을 필요할 때 생성하고 TTL 만료와 함께 자동 폐기합니다.
+    level: 중급
+    durationMinutes: 60
+    delivery: integration
+    readiness: requires-integration
+    outcomes:
+      - Database Secrets Engine 연결
+      - 동적 사용자 발급과 lease 갱신
+      - revoke 후 접근 차단 검증
+    requirements:
+      - 교육용 PostgreSQL
+      - 격리된 데이터베이스 관리자 계정
+
+  - id: aws-dynamic-credentials
+    title: AWS 동적 자격 증명
+    summary: 최소 권한 샌드박스 역할로 단기 AWS 자격 증명을 발급하고 폐기합니다.
+    level: 고급
+    durationMinutes: 60
+    delivery: integration
+    readiness: requires-integration
+    outcomes:
+      - AWS Secrets Engine과 IAM 역할 연결
+      - STS 기반 단기 자격 증명 발급
+      - CloudTrail과 Vault lease 연계 감사
+    requirements:
+      - 교육 전용 AWS 계정 또는 OU
+      - Permission Boundary가 적용된 IAM 역할
+      - 비용·리소스 정리 정책
+
+  - id: kubernetes-auth
+    title: Kubernetes Auth
+    summary: ServiceAccount 신원을 검증해 Pod에 최소 권한 Vault 토큰을 제공합니다.
+    level: 고급
+    durationMinutes: 70
+    delivery: integration
+    readiness: requires-integration
+    outcomes:
+      - Kubernetes Auth Method 구성
+      - ServiceAccount와 Vault Role 매핑
+      - 잘못된 namespace·audience 실패 진단
+    requirements:
+      - 교육용 Kubernetes 클러스터
+      - TokenReview 권한
+
+  - id: oidc-jwt-auth
+    title: OIDC·JWT 인증
+    summary: 사람과 워크로드의 JWT claim을 Vault 정책과 안전하게 연결합니다.
+    level: 고급
+    durationMinutes: 55
+    delivery: integration
+    readiness: requires-integration
+    outcomes:
+      - Discovery URL과 audience 설정
+      - bound claims 기반 역할 설계
+      - 잘못된 issuer·claim 실패 진단
+    requirements:
+      - 교육용 OIDC Provider
+      - 테스트 사용자와 Client
+
+  - id: agent-auto-auth
+    title: Vault Agent·Auto-Auth
+    summary: 애플리케이션이 토큰을 직접 관리하지 않도록 Auto-Auth, Sink, Template을 구성합니다.
+    level: 중급
+    durationMinutes: 55
+    delivery: native
+    readiness: ready
+    outcomes:
+      - AppRole Auto-Auth 구성
+      - 파일 Sink 권한과 토큰 갱신
+      - Template 렌더링과 프로세스 재기동
+    requirements: []
+
+  - id: raft-operations
+    title: Integrated Storage·Raft 운영
+    summary: 다중 노드 초기화, join, snapshot, 리더 장애와 복구를 안전한 별도 환경에서 다룹니다.
+    level: 고급
+    durationMinutes: 90
+    delivery: dedicated
+    readiness: requires-integration
+    outcomes:
+      - Raft 노드 join과 리더 확인
+      - snapshot 백업·복구
+      - quorum 손실과 autopilot 진단
+    requirements:
+      - 전용 3노드 교육 환경
+      - KMS Auto Unseal 또는 안전한 복구 키 절차
+
+  - id: terraform-provider
+    title: Terraform Vault Provider
+    summary: 정책과 인증 역할을 코드로 관리하고 plan에서 민감정보 노출을 점검합니다.
+    level: 중급
+    durationMinutes: 50
+    delivery: native
+    readiness: ready
+    outcomes:
+      - Provider 인증과 최소 권한 토큰 구성
+      - Policy·Auth Role 코드화
+      - State와 로그의 민감정보 노출 방지
+    requirements:
+      - terraform

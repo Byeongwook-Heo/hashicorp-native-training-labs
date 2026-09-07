@@ -1,0 +1,18 @@
+[Unit]
+Description=Remove expired native Vault training sessions
+Requires=vault-lab-storage.target
+After=vault-lab-storage.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vault-lab-reaper
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/vault-lab/slots /run/lock/vault-lab-control /var/lib/vault-lab
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID CAP_SETGID CAP_SETUID CAP_KILL
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes

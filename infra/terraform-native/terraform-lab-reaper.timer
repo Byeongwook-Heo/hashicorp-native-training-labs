@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically expire native Terraform Lab sessions
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=terraform-lab-reaper.service
+
+[Install]
+WantedBy=timers.target
